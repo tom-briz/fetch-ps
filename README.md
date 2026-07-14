@@ -4,6 +4,14 @@
 
 ---
 
+## Provenance & Disclaimer
+
+> **Original Work Notice:** > This project (`fetch-ps`) and its architectural design, concepts, and codebase were conceptualized and originally built by **tom-briz**. It is a direct PowerShell port and sibling to the original Google Apps Script (GAS) library [`fetch-gs`](https://github.com/tom-briz/fetch-gs). Any similarities, structural patterns, or shared philosophies are intentional—this code is entirely original and authored by the same creator to maintain a unified cross-platform workflow between Google Workspace and PowerShell environments.
+
+
+
+---
+
 ## Features
 
 * **Native PowerShell Pipelines:** Leverages core PowerShell web commands (`Invoke-WebRequest`) and outputs structured `PSCustomObject` descriptors.
