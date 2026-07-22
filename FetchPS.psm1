@@ -66,6 +66,44 @@ function Build-RequestOptions {
 
 <#
 .SYNOPSIS
+    Converts a WebHeaderCollection to a clean PowerShell Hashtable.
+.DESCRIPTION
+    Parses the .Headers property from an Invoke-WebRequest response.
+    Unwraps single-item arrays to scalars for easier access.
+.PARAMETER WebHeaders
+    The .Headers property from an Invoke-WebRequest response object.
+.OUTPUTS
+    [hashtable]
+#>
+function Convert-WebHeadersToHashtable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $WebHeaders
+    )
+
+    $headerMap = @{}
+    
+    if (-not $WebHeaders) { return $headerMap }
+
+    $WebHeaders.GetEnumerator() | ForEach-Object {
+        $key = $_.Key
+        $val = $_.Value
+        
+        # Unwrap single-item arrays (e.g., "Content-Type" is often ["application/json"])
+        if ($val -is [array] -and $val.Count -eq 1) {
+            $headerMap[$key] = $val[0]
+        }
+        else {
+            $headerMap[$key] = $val
+        }
+    }
+
+    return $headerMap
+}
+
+<#
+.SYNOPSIS
     Centralized parser and normalization factory for PowerShell web responses.
 .DESCRIPTION
     Accepts raw web response objects or network error records, calculates duration metrics, 
@@ -205,16 +243,16 @@ function Normalize-Content {
 
 <#
 .SYNOPSIS
-    Makes a single synchronous HTTP call.
+    Makes a single synchronous HTTP call with headers.
 .DESCRIPTION
     Makes a single raw synchronous call and returns an object containing
-    the underlying response object and the extracted text string.
+    the underlying response object, the extracted text string, and the response headers.
 .PARAMETER Url
     The target URL.
 .PARAMETER Params
     Optional request configuration hashtable.
 .OUTPUTS
-    [PSCustomObject] Containing Resp and Text properties.
+    [PSCustomObject] Containing Resp, Text, and Headers properties.
 #>
 function Invoke-LightRequestRaw {
     [CmdletBinding()]
@@ -250,9 +288,14 @@ function Invoke-LightRequestRaw {
 
     try {
         $response = Invoke-WebRequest @webArgs
+        
+        # Parse headers
+        $parsedHeaders = Convert-WebHeadersToHashtable -WebHeaders $response.Headers
+
         return [PSCustomObject]@{
-            Resp = $response
-            Text = if ($response.Content) { $response.Content } else { "" }
+            Resp    = $response
+            Text    = if ($response.Content) { $response.Content } else { "" }
+            Headers = $parsedHeaders
         }
     }
     catch {
@@ -263,18 +306,18 @@ function Invoke-LightRequestRaw {
 
 <#
 .SYNOPSIS
-    Performs chunked batch HTTP requests with rate-limiting support.
+    Performs chunked batch HTTP requests with rate-limiting support and per-request error handling.
 .DESCRIPTION
-    Multi-URL light batch calls using sequential chunking and optional delays 
-    between chunks to replicate fetch-gs behavior in native PowerShell.
+    Multi-URL light batch calls using sequential chunking. Errors on individual requests
+    are caught and recorded without stopping the entire batch.
 .PARAMETER Requests
-    Array of string URLs or hashtable config objects containing Url and Params.
+    Array of string URLs or hashtable config objects.
 .PARAMETER SharedParams
     Default parameters shared across all items.
 .PARAMETER RateConfig
-    Rate limiting configurations hashtable with ChunkSize and DelayMs keys.
+    Rate limiting configurations hashtable.
 .OUTPUTS
-    [PSCustomObject[]] Array of objects containing Resp and Text properties.
+    [PSCustomObject[]] Array of objects containing Resp, Text, and Headers.
 #>
 function Invoke-LightBatchRaw {
     [CmdletBinding()]
@@ -294,57 +337,70 @@ function Invoke-LightBatchRaw {
     }
 
     $chunkSize = if ($RateConfig.ContainsKey('ChunkSize')) { $RateConfig.ChunkSize } else { 10 }
-    $delayMs = if ($RateConfig.ContainsKey('DelayMs')) { $RateConfig.DelayMs } else { 1000 }
+    $delayMs = if ($RateConfig.ContainsKey('DelayMs')) { $RateConfig.DelayMs } else { 0 } # Default to 0 delay if not specified
     $results = [System.Collections.Generic.List[object]]::new()
 
     for ($i = 0; $i -lt $Requests.Count; $i += $chunkSize) {
-        $chunk = $Requests[$i..([Math]::Min($i + $chunkSize - 1, $Requests.Count - 1))]
-        $chunkResults = [System.Collections.Generic.List[object]]::new()
+        # Define the chunk range
+        $endIndex = [Math]::Min($i + $chunkSize - 1, $Requests.Count - 1)
+        $chunk = $Requests[$i..$endIndex]
 
-        try {
-            foreach ($req in $chunk) {
-                $isString = $req -is [string]
-                $targetUrl = if ($isString) { $req } else { $req.Url }
-                $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
+        foreach ($req in $chunk) {
+            $isString = $req -is [string]
+            $targetUrl = if ($isString) { $req } else { $req.Url }
+            $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
 
-                # Merge shared parameters and request specific parameters
-                $merged = $SharedParams.Clone()
-                foreach ($key in $reqParams.Keys) {
-                    $merged[$key] = $reqParams[$key]
-                }
+            # Merge shared parameters and request specific parameters
+            $merged = $SharedParams.Clone()
+            foreach ($key in $reqParams.Keys) {
+                $merged[$key] = $reqParams[$key]
+            }
 
-                $options = Build-RequestOptions -Params $merged
-                $webArgs = @{
-                    Uri                = $targetUrl
-                    Method             = $options.Method
-                    SkipHttpErrorCheck = $true
-                    MaximumRedirection = $options.MaximumRedirection
-                    TimeoutSec         = $options.TimeoutSec
-                    ErrorAction        = 'Stop'
-                }
+            $options = Build-RequestOptions -Params $merged
+            $webArgs = @{
+                Uri                = $targetUrl
+                Method             = $options.Method
+                SkipHttpErrorCheck = $true
+                MaximumRedirection = $options.MaximumRedirection
+                TimeoutSec         = $options.TimeoutSec
+                ErrorAction        = 'Stop' # Critical: ensures Invoke-WebRequest throws on errors
+            }
 
-                if ($options.Headers.Count -gt 0) { $webArgs['Headers'] = $options.Headers }
-                if ($options.Body) { $webArgs['Body'] = $options.Body }
-                if ($options.ContentType) { $webArgs['ContentType'] = $options.ContentType }
+            if ($options.Headers.Count -gt 0) { $webArgs['Headers'] = $options.Headers }
+            if ($options.Body) { $webArgs['Body'] = $options.Body }
+            if ($options.ContentType) { $webArgs['ContentType'] = $options.ContentType }
 
+            try {
+                # Execute the request
                 $res = Invoke-WebRequest @webArgs
-                $chunkResults.Add([PSCustomObject]@{
-                    Resp = $res
-                    Text = if ($res.Content) { $res.Content } else { "" }
+                $parsedHeaders = Convert-WebHeadersToHashtable -WebHeaders $res.Headers
+
+                # Success: Add result
+                $results.Add([PSCustomObject]@{
+                    Resp    = $res
+                    Text    = if ($res.Content) { $res.Content } else { "" }
+                    Headers = $parsedHeaders
+                    Success = $true
+                    Error   = $null
                 })
             }
-            foreach ($item in $chunkResults) {
-                $results.Add($item)
-            }
-        }
-        catch {
-            Write-Error "[Fetcher:LightBatch] Chunk execution failed at index $i: $($_.Exception.Message)"
-            foreach ($item in $chunk) {
-                $results.Add([PSCustomObject]@{ Resp = $null; Text = "" })
+            catch {
+                # Failure: Log error and add a failure placeholder
+                $errorMsg = $_.Exception.Message
+                Write-Warning "[Fetcher:LightBatch] Request failed for $targetUrl: $errorMsg"
+                
+                $results.Add([PSCustomObject]@{
+                    Resp    = $null
+                    Text    = ""
+                    Headers = @{}
+                    Success = $false
+                    Error   = $errorMsg
+                })
             }
         }
 
-        if (($i + $chunkSize -lt $Requests.Count) -and ($delayMs -gt 0)) {
+        # Apply delay between chunks (not between every single request if chunkSize > 1)
+        if ($delayMs -gt 0 -and ($i + $chunkSize) -lt $Requests.Count) {
             Start-Sleep -Milliseconds $delayMs
         }
     }
@@ -380,18 +436,54 @@ function Invoke-StructuredRequest {
     $startTime = Get-Date
     $upperMethod = $method.ToUpper()
 
+    # --- IDENTICAL INITIALIZATION BLOCK ---
     $responseObj = $null
+    $headersObj = @{}
     $requestError = $null
 
     try {
+        # 1. Fetch raw data
         $fetchResult = Invoke-LightRequestRaw -Url $Url -Params $Params
-        $responseObj = if ($fetchResult) { $fetchResult.Resp } else { $null }
+        
+        if ($fetchResult) {
+            $responseObj = $fetchResult.Resp
+            $headersObj = $fetchResult.Headers
+            
+            # If the raw request returned null content (e.g., 404 handled as "success" but empty)
+            # we still proceed to normalization, but if the fetch itself threw, we catch it here.
+            if (-not $responseObj) {
+                $requestError = "No response object returned from request"
+            }
+        }
+        else {
+            $requestError = "Request returned no result"
+        }
+
+        # 2. Normalize content (Headers NOT passed to Normalize-Content)
+        $normalizedResult = Normalize-Content -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
+
+        # 3. Inject headers
+        if ($normalizedResult) {
+            $normalizedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+        }
+
+        return $normalizedResult
     }
     catch {
-        $requestError = $_.Exception.Message
+        # --- SAFE FAILURE OBJECT PATTERN ---
+        # If anything fails (fetch, normalization, injection), create a safe object
+        # so the caller always gets a structured response, never a script crash.
+        $errorMsg = $_.Exception.Message
+        Write-Warning "[Fetcher:StructuredRequest] Request failed for $Url: $errorMsg"
+        
+        # Create a safe failure object using the normalizer
+        $failureObj = Normalize-Content -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
+        
+        # Inject empty headers for structural consistency
+        $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
+        
+        return $failureObj
     }
-
-    return Normalize-Content -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
 }
 
 <#
@@ -422,36 +514,89 @@ function Invoke-StructuredBatch {
         [hashtable]$RateConfig = @{}
     )
 
-    if (-not $Requests -or $Requests.Count -eq 0) {
-        return @()
-    }
+    if (-not $Requests -or $Requests.Count -eq 0) { return @() }
 
+    # Pre-fetch raw data (including headers) from the batch function.
+    # Note: Invoke-LightBatchRaw handles network errors and returns safe placeholders.
     $lightBatch = Invoke-LightBatchRaw -Requests $Requests -SharedParams $SharedParams -RateConfig $RateConfig
+    
     $startTime = Get-Date
     $results = [System.Collections.Generic.List[object]]::new()
 
     for ($index = 0; $index -lt $Requests.Count; $index++) {
         $req = $Requests[$index]
         $item = $lightBatch[$index]
+
+        # --- DIFFERENCE 1: URL Resolution ---
+        # Single Function: $Url is a direct parameter.
+        # Batch Function: Extract URL from $req (string or hashtable).
         $isString = $req -is [string]
         $targetUrl = if ($isString) { $req } else { $req.Url }
 
+        # --- DIFFERENCE 2: Parameter Merging ---
+        # Single Function: $Params passed directly.
+        # Batch Function: Manually merge $SharedParams with request-specific params.
         $merged = $SharedParams.Clone()
         if (-not $isString -and $req.ContainsKey('Params')) {
-            foreach ($k in $req.Params.Keys) {
-                $merged[$k] = $req.Params[$k]
-            }
+            foreach ($k in $req.Params.Keys) { $merged[$k] = $req.Params[$k] }
         }
 
         $inputType = if ($merged.ContainsKey('InputType')) { $merged.InputType } else { 'TXT' }
         $method = if ($merged.ContainsKey('Method')) { $merged.Method } else { 'GET' }
         $upperMethod = $method.ToUpper()
 
-        $responseObj = if ($item) { $item.Resp } else { $null }
-        $errorMsg = if (-not $responseObj) { "Chunk execution error or no response" } else { $null }
+        # --- IDENTICAL INITIALIZATION BLOCK ---
+        # Matches Invoke-StructuredRequest exactly
+        $responseObj = $null
+        $headersObj = @{}
+        $requestError = $null
 
-        $normalized = Normalize-Content -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $errorMsg
-        $results.Add($normalized)
+        # --- IDENTICAL TRY/CATCH BLOCK ---
+        # Mirrors Invoke-StructuredRequest logic for stability.
+        # Even though $item comes from Invoke-LightBatchRaw, we wrap the extraction 
+        # and normalization in try/catch to protect against parsing errors 
+        # or unexpected null states in the loop.
+        try {
+            if ($item) {
+                $responseObj = $item.Resp
+                $headersObj = $item.Headers
+                
+                # If the raw item had no response (network failure handled upstream),
+                # we set a specific error message to pass to normalization.
+                if (-not $responseObj) {
+                    $requestError = "Chunk execution error or no response"
+                }
+            }
+            else {
+                # Fallback if the batch result array is missing an index
+                $requestError = "No batch item found at index $index"
+            }
+            
+            # Normalization happens inside the try block so we can catch errors
+            # during parsing (e.g., invalid JSON/XML)
+            $normalizedResult = Normalize-Content -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
+
+            # --- IDENTICAL INJECTION STEP ---
+            if ($normalizedResult) {
+                $normalizedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+            }
+
+            $results.Add($normalizedResult)
+        }
+        catch {
+            # If anything fails during extraction, parsing, or injection,
+            # we log it and add a safe failure object to the results.
+            $errorMsg = $_.Exception.Message
+            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $targetUrl: $errorMsg"
+            
+            # Create a safe failure object that matches the successful structure
+            $failureObj = Normalize-Content -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
+            
+            # Inject empty headers for consistency
+            $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
+            
+            $results.Add($failureObj)
+        }
     }
 
     return $results.ToArray()
