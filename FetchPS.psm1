@@ -228,7 +228,7 @@ function Normalize-Content {
             Format     = "TXT"
             Size       = $raw.Length
             Data       = $raw
-            Error      = "Parse error for $InputType: $($_.Exception.Message)"
+            Error      = "Parse error for $($InputType): $($_.Exception.Message)"
         }
     }
 }
@@ -299,7 +299,7 @@ function Invoke-LightRequestRaw {
         }
     }
     catch {
-        Write-Error "[Fetcher:Light] Error fetching URL $Url: $_"
+        Write-Error "[Fetcher:Light] Error fetching URL $($Url): $(_)"
         throw "Light request error: $_"
     }
 }
@@ -387,7 +387,7 @@ function Invoke-LightBatchRaw {
             catch {
                 # Failure: Log error and add a failure placeholder
                 $errorMsg = $_.Exception.Message
-                Write-Warning "[Fetcher:LightBatch] Request failed for $targetUrl: $errorMsg"
+                Write-Warning "[Fetcher:LightBatch] Request failed for ${targetUrl}: ${errorMsg}"
                 
                 $results.Add([PSCustomObject]@{
                     Resp    = $null
@@ -474,7 +474,7 @@ function Invoke-StructuredRequest {
         # If anything fails (fetch, normalization, injection), create a safe object
         # so the caller always gets a structured response, never a script crash.
         $errorMsg = $_.Exception.Message
-        Write-Warning "[Fetcher:StructuredRequest] Request failed for $Url: $errorMsg"
+        Write-Warning "[Fetcher:StructuredRequest] Request failed for ${Url}: ${errorMsg}"
         
         # Create a safe failure object using the normalizer
         $failureObj = Normalize-Content -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
@@ -587,10 +587,10 @@ function Invoke-StructuredBatch {
             # If anything fails during extraction, parsing, or injection,
             # we log it and add a safe failure object to the results.
             $errorMsg = $_.Exception.Message
-            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $targetUrl: $errorMsg"
+            Write-Warning "[Fetcher:StructuredBatch] Processing failed for ${targetUrl}: ${errorMsg}"
             
             # Create a safe failure object that matches the successful structure
-            $failureObj = Normalize-Content -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
+            $failureObj = Normalize-Content -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: ${errorMsg}"
             
             # Inject empty headers for consistency
             $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
