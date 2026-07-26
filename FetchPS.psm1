@@ -6,6 +6,7 @@
 .OUTPUTS
     [PSCustomObject] Project metadata information.
 #>
+
 function Get-ProjectInfo {
     [CmdletBinding()]
     param()
@@ -26,6 +27,9 @@ function Get-ProjectInfo {
  * INTERNAL HELPER UTILITIES
  * ============================================================================
 #>
+
+# Script-level variable evaluated once on file load to check PowerShell version
+$script:SupportsSkipHttpErrorCheck = ($PSVersionTable.PSVersion.Major -ge 7)
 
 
 <#
@@ -53,15 +57,20 @@ function Build-RequestOptions {
 
     $contentType = if ($headers.ContainsKey('Content-Type')) { $headers['Content-Type'] } else { $null }
 
-    return [PSCustomObject]@{
+    $options = [ordered]@{
         Method             = $method.ToUpper()
         Headers            = $headers
         Body               = $payload
-        SkipHttpErrorCheck = $true
         MaximumRedirection = 10
         ContentType        = $contentType
         TimeoutSec         = [Math]::Ceiling($timeout / 1000)
     }
+
+    if ($script:SupportsSkipHttpErrorCheck) {
+        $options['SkipHttpErrorCheck'] = $true
+    }
+
+    return [PSCustomObject]$options
 }
 
 <#
@@ -265,15 +274,18 @@ function Invoke-LightRequestRaw {
     )
 
     $options = Build-RequestOptions -Params $Params
-    
+
     # Map customized options to standard Invoke-WebRequest parameter set
     $webArgs = @{
         Uri                = $Url
         Method             = $options.Method
-        SkipHttpErrorCheck = $options.SkipHttpErrorCheck
         MaximumRedirection = $options.MaximumRedirection
         TimeoutSec         = $options.TimeoutSec
         ErrorAction        = 'Stop'
+    }
+
+    if ($script:SupportsSkipHttpErrorCheck) {
+        $webArgs['SkipHttpErrorCheck'] = $options.SkipHttpErrorCheck
     }
 
     if ($options.Headers.Count -gt 0) {
@@ -299,8 +311,8 @@ function Invoke-LightRequestRaw {
         }
     }
     catch {
-        Write-Error "[Fetcher:Light] Error fetching URL $($Url): $(_)"
-        throw "Light request error: $_"
+        Write-Error "[Fetcher:Light] Error fetching URL $($Url): $($_.Exception.Message)"
+        throw "Light request error: $($_.Exception.Message)"
     }
 }
 
@@ -360,10 +372,13 @@ function Invoke-LightBatchRaw {
             $webArgs = @{
                 Uri                = $targetUrl
                 Method             = $options.Method
-                SkipHttpErrorCheck = $true
                 MaximumRedirection = $options.MaximumRedirection
                 TimeoutSec         = $options.TimeoutSec
                 ErrorAction        = 'Stop' # Critical: ensures Invoke-WebRequest throws on errors
+            }
+
+            if ($script:SupportsSkipHttpErrorCheck) {
+                $webArgs['SkipHttpErrorCheck'] = $options.SkipHttpErrorCheck
             }
 
             if ($options.Headers.Count -gt 0) { $webArgs['Headers'] = $options.Headers }
@@ -387,7 +402,7 @@ function Invoke-LightBatchRaw {
             catch {
                 # Failure: Log error and add a failure placeholder
                 $errorMsg = $_.Exception.Message
-                Write-Warning "[Fetcher:LightBatch] Request failed for ${targetUrl}: ${errorMsg}"
+                Write-Warning "[Fetcher:LightBatch] Request failed for $($targetUrl): $($errorMsg)"
                 
                 $results.Add([PSCustomObject]@{
                     Resp    = $null
@@ -474,10 +489,10 @@ function Invoke-StructuredRequest {
         # If anything fails (fetch, formatting, injection), create a safe object
         # so the caller always gets a structured response, never a script crash.
         $errorMsg = $_.Exception.Message
-        Write-Warning "[Fetcher:StructuredRequest] Request failed for ${Url}: ${errorMsg}"
+        Write-Warning "[Fetcher:StructuredRequest] Request failed for $($Url): $($errorMsg)"
         
         # Create a safe failure object using the formatter
-        $failureObj = Format-WebResponse -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
+        $failureObj = Format-WebResponse -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMsg)"
         
         # Inject empty headers for structural consistency
         $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
@@ -569,7 +584,7 @@ function Invoke-StructuredBatch {
             }
             else {
                 # Fallback if the batch result array is missing an index
-                $requestError = "No batch item found at index $index"
+                $requestError = "No batch item found at index $($index)"
             }
             
         # Formatting happens inside the try block so we can catch errors
@@ -587,10 +602,10 @@ function Invoke-StructuredBatch {
             # If anything fails during extraction, parsing, or injection,
             # we log it and add a safe failure object to the results.
             $errorMsg = $_.Exception.Message
-            Write-Warning "[Fetcher:StructuredBatch] Processing failed for ${targetUrl}: ${errorMsg}"
+            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $($targetUrl): $($errorMsg)"
             
             # Create a safe failure object that matches the successful structure
-            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: ${errorMsg}"
+            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMsg)"
             
             # Inject empty headers for consistency
             $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
