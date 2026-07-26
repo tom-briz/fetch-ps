@@ -104,10 +104,10 @@ function Convert-WebHeadersToHashtable {
 
 <#
 .SYNOPSIS
-    Centralized parser and normalization factory for PowerShell web responses.
+    Centralized parser and formatting factory for PowerShell web responses.
 .DESCRIPTION
     Accepts raw web response objects or network error records, calculates duration metrics, 
-    and normalizes payloads into a fully structured custom object with formatting for JSON, XML, or TXT.
+    and formats payloads into a fully structured custom object with support for JSON, XML, or TXT.
 .PARAMETER Response
     The raw response object returned from `Invoke-WebRequest` or similar, or `$null`.
 .PARAMETER Url
@@ -123,7 +123,7 @@ function Convert-WebHeadersToHashtable {
 .OUTPUTS
     [PSCustomObject] Fully structured payload descriptor.
 #>
-function Normalize-Content {
+function Format-WebResponse {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $false)]
@@ -410,10 +410,10 @@ function Invoke-LightBatchRaw {
 
 <#
 .SYNOPSIS
-    Fetches remote content and normalizes it into a structured descriptor.
+    Fetches remote content and formats it into a structured descriptor.
 .DESCRIPTION
-    Fetches remote content using `Invoke-LightRequestRaw` and delegates normalization 
-    to `Normalize-Content` with support for explicit input formats (`JSON`, `XML`, `TXT`).
+    Fetches remote content using `Invoke-LightRequestRaw` and delegates formatting 
+    to `Format-WebResponse` with support for explicit input formats (`JSON`, `XML`, `TXT`).
 .PARAMETER Url
     The target URL.
 .PARAMETER Params
@@ -450,7 +450,7 @@ function Invoke-StructuredRequest {
             $headersObj = $fetchResult.Headers
             
             # If the raw request returned null content (e.g., 404 handled as "success" but empty)
-            # we still proceed to normalization, but if the fetch itself threw, we catch it here.
+            # we still proceed to formatting, but if the fetch itself threw, we catch it here.
             if (-not $responseObj) {
                 $requestError = "No response object returned from request"
             }
@@ -459,25 +459,25 @@ function Invoke-StructuredRequest {
             $requestError = "Request returned no result"
         }
 
-        # 2. Normalize content (Headers NOT passed to Normalize-Content)
-        $normalizedResult = Normalize-Content -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
+        # 2. Format response content (Headers NOT passed to Format-WebResponse)
+        $formattedResult = Format-WebResponse -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
 
         # 3. Inject headers
-        if ($normalizedResult) {
-            $normalizedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+        if ($formattedResult) {
+            $formattedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
         }
 
-        return $normalizedResult
+        return $formattedResult
     }
     catch {
         # --- SAFE FAILURE OBJECT PATTERN ---
-        # If anything fails (fetch, normalization, injection), create a safe object
+        # If anything fails (fetch, formatting, injection), create a safe object
         # so the caller always gets a structured response, never a script crash.
         $errorMsg = $_.Exception.Message
         Write-Warning "[Fetcher:StructuredRequest] Request failed for ${Url}: ${errorMsg}"
         
-        # Create a safe failure object using the normalizer
-        $failureObj = Normalize-Content -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
+        # Create a safe failure object using the formatter
+        $failureObj = Format-WebResponse -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $errorMsg"
         
         # Inject empty headers for structural consistency
         $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
@@ -554,7 +554,7 @@ function Invoke-StructuredBatch {
         # --- IDENTICAL TRY/CATCH BLOCK ---
         # Mirrors Invoke-StructuredRequest logic for stability.
         # Even though $item comes from Invoke-LightBatchRaw, we wrap the extraction 
-        # and normalization in try/catch to protect against parsing errors 
+        # and formatting in try/catch to protect against parsing errors 
         # or unexpected null states in the loop.
         try {
             if ($item) {
@@ -562,7 +562,7 @@ function Invoke-StructuredBatch {
                 $headersObj = $item.Headers
                 
                 # If the raw item had no response (network failure handled upstream),
-                # we set a specific error message to pass to normalization.
+                # we set a specific error message to pass to formatting.
                 if (-not $responseObj) {
                     $requestError = "Chunk execution error or no response"
                 }
@@ -572,16 +572,16 @@ function Invoke-StructuredBatch {
                 $requestError = "No batch item found at index $index"
             }
             
-            # Normalization happens inside the try block so we can catch errors
+        # Formatting happens inside the try block so we can catch errors
             # during parsing (e.g., invalid JSON/XML)
-            $normalizedResult = Normalize-Content -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
+            $formattedResult = Format-WebResponse -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
 
             # --- IDENTICAL INJECTION STEP ---
-            if ($normalizedResult) {
-                $normalizedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+            if ($formattedResult) {
+                $formattedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
             }
 
-            $results.Add($normalizedResult)
+            $results.Add($formattedResult)
         }
         catch {
             # If anything fails during extraction, parsing, or injection,
@@ -590,7 +590,7 @@ function Invoke-StructuredBatch {
             Write-Warning "[Fetcher:StructuredBatch] Processing failed for ${targetUrl}: ${errorMsg}"
             
             # Create a safe failure object that matches the successful structure
-            $failureObj = Normalize-Content -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: ${errorMsg}"
+            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: ${errorMsg}"
             
             # Inject empty headers for consistency
             $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
