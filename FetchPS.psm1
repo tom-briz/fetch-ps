@@ -270,7 +270,10 @@ function Invoke-LightRequestRaw {
         [string]$Url,
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Params = @{}
+        [hashtable]$Params = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+')
     )
 
     $options = Build-RequestOptions -Params $Params
@@ -311,8 +314,16 @@ function Invoke-LightRequestRaw {
         }
     }
     catch {
-        Write-Error "[Fetcher:Light] Error fetching URL $($Url): $($_.Exception.Message)"
-        throw "Light request error: $($_.Exception.Message)"
+        $errorMessage = $_.Exception.Message
+        $targetUrl = $Url
+
+        foreach ($pattern in $MaskPatterns) {
+            $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
+            $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
+        }
+
+        Write-Error "[Fetcher:Light] Error fetching URL $($targetUrl): $($errorMessage)"
+        throw "Light request error: $($errorMessage)"
     }
 }
 
@@ -339,6 +350,9 @@ function Invoke-LightBatchRaw {
 
         [Parameter(Mandatory = $false)]
         [hashtable]$SharedParams = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+'),
 
         [Parameter(Mandatory = $false)]
         [hashtable]$RateConfig = @{}
@@ -400,16 +414,23 @@ function Invoke-LightBatchRaw {
                 })
             }
             catch {
+                $errorMessage = $_.Exception.Message
+                #$targetUrl = $Url
+
+                foreach ($pattern in $MaskPatterns) {
+                    $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
+                    $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
+                }
+
                 # Failure: Log error and add a failure placeholder
-                $errorMsg = $_.Exception.Message
-                Write-Warning "[Fetcher:LightBatch] Request failed for $($targetUrl): $($errorMsg)"
+                Write-Warning "[Fetcher:LightBatch] Request failed for $($targetUrl): $($errorMessage)"
                 
                 $results.Add([PSCustomObject]@{
                     Resp    = $null
                     Text    = ""
                     Headers = @{}
                     Success = $false
-                    Error   = $errorMsg
+                    Error   = $errorMessage
                 })
             }
         }
@@ -443,7 +464,10 @@ function Invoke-StructuredRequest {
         [string]$Url,
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Params = @{}
+        [hashtable]$Params = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+')
     )
 
     $inputType = if ($Params.ContainsKey('InputType')) { $Params.InputType } else { 'TXT' }
@@ -485,14 +509,21 @@ function Invoke-StructuredRequest {
         return $formattedResult
     }
     catch {
+        $errorMessage = $_.Exception.Message
+        $targetUrl = $Url
+
+        foreach ($pattern in $MaskPatterns) {
+            $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
+            $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
+        }
+
         # --- SAFE FAILURE OBJECT PATTERN ---
         # If anything fails (fetch, formatting, injection), create a safe object
         # so the caller always gets a structured response, never a script crash.
-        $errorMsg = $_.Exception.Message
-        Write-Warning "[Fetcher:StructuredRequest] Request failed for $($Url): $($errorMsg)"
+        Write-Warning "[Fetcher:StructuredRequest] Request failed for $($targetUrl): $($errorMessage)"
         
         # Create a safe failure object using the formatter
-        $failureObj = Format-WebResponse -Response $null -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMsg)"
+        $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMessage)"
         
         # Inject empty headers for structural consistency
         $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
@@ -524,6 +555,9 @@ function Invoke-StructuredBatch {
 
         [Parameter(Mandatory = $false)]
         [hashtable]$SharedParams = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+'),
 
         [Parameter(Mandatory = $false)]
         [hashtable]$RateConfig = @{}
@@ -599,13 +633,20 @@ function Invoke-StructuredBatch {
             $results.Add($formattedResult)
         }
         catch {
+            $errorMessage = $_.Exception.Message
+            #$targetUrl = $Url
+
+            foreach ($pattern in $MaskPatterns) {
+                $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
+                $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
+            }
+
             # If anything fails during extraction, parsing, or injection,
             # we log it and add a safe failure object to the results.
-            $errorMsg = $_.Exception.Message
-            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $($targetUrl): $($errorMsg)"
+            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $($targetUrl): $($errorMessage)"
             
             # Create a safe failure object that matches the successful structure
-            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMsg)"
+            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMessage)"
             
             # Inject empty headers for consistency
             $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
