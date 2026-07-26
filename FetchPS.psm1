@@ -260,6 +260,8 @@ function Format-WebResponse {
     The target URL.
 .PARAMETER Params
     Optional request configuration hashtable.
+.PARAMETER MaskPatterns
+    An array of regular expression strings used to locate and mask sensitive data in URLs and error messages.
 .OUTPUTS
     [PSCustomObject] Containing Resp, Text, and Headers properties.
 #>
@@ -337,6 +339,8 @@ function Invoke-LightRequestRaw {
     Array of string URLs or hashtable config objects.
 .PARAMETER SharedParams
     Default parameters shared across all items.
+.PARAMETER MaskPatterns
+    An array of regular expression strings used to locate and mask sensitive data in URLs and error messages.
 .PARAMETER RateConfig
     Rate limiting configurations hashtable.
 .OUTPUTS
@@ -454,6 +458,8 @@ function Invoke-LightBatchRaw {
     The target URL.
 .PARAMETER Params
     Optional request configuration hashtable including `InputType` and `Method`.
+.PARAMETER MaskPatterns
+    An array of regular expression strings used to locate and mask sensitive data in URLs and error messages.
 .OUTPUTS
     [PSCustomObject] Fully structured payload descriptor.
 #>
@@ -542,6 +548,8 @@ function Invoke-StructuredRequest {
     Array of URLs or hashtable configuration objects.
 .PARAMETER SharedParams
     Default parameters shared across all items.
+.PARAMETER MaskPatterns
+    An array of regular expression strings used to locate and mask sensitive data in URLs and error messages.
 .PARAMETER RateConfig
     Rate limiting configurations hashtable with `ChunkSize` and `DelayMs` keys.
 .OUTPUTS
