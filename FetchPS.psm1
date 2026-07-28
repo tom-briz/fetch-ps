@@ -28,9 +28,23 @@ function Get-ProjectInfo {
  * ============================================================================
 #>
 
-# Script-level variable evaluated once on file load to check PowerShell version
-$script:SupportsSkipHttpErrorCheck = ($PSVersionTable.PSVersion.Major -ge 7)
+$script:DEFAULT_CONFIG = @{
+    # HTTP Request Defaults
+    DefaultMethod = "GET"
+    DefaultTimeoutMs = 30000
+    DefaultDelayMs = 0
+    
+    # Security: Default regex patterns to mask sensitive data
+    DefaultMaskPatterns = @(
+        'key=[^&]+',               
+        'Authorization:\s*[^\s]+', 
+        'password=[^&]+',          
+        'token=[^&]+'              
+    )
+}
 
+# Check PowerShell version for SkipHttpErrorCheck support (PS 7+)
+$script:SupportsSkipHttpErrorCheck = ($PSVersionTable.PSVersion.Major -ge 7)
 
 <#
 .SYNOPSIS
@@ -50,10 +64,13 @@ function Build-RequestOptions {
         [hashtable]$Params = @{}
     )
 
-    $method = if ($Params.ContainsKey('Method')) { $Params.Method } else { 'GET' }
+    $method = if ($Params.ContainsKey('Method')) { $Params.Method } else { $script:DEFAULT_CONFIG.DefaultMethod }
     $headers = if ($Params.ContainsKey('Headers')) { $Params.Headers } else { @{} }
     $payload = if ($Params.ContainsKey('Payload')) { $Params.Payload } else { $null }
-    $timeout = if ($Params.ContainsKey('Timeout')) { $Params.Timeout } else { 30000 }
+    $timeout = if ($Params.ContainsKey('Timeout')) { $Params.Timeout } else { $script:DEFAULT_CONFIG.DefaultTimeoutMs }
+    
+    # Mask patterns: Use custom if provided, else global default
+    $maskPatterns = if ($Params.ContainsKey('MaskPatterns')) { $Params.MaskPatterns } else { $script:DEFAULT_CONFIG.DefaultMaskPatterns }
 
     $contentType = if ($headers.ContainsKey('Content-Type')) { $headers['Content-Type'] } else { $null }
 
@@ -70,6 +87,8 @@ function Build-RequestOptions {
         $options['SkipHttpErrorCheck'] = $true
     }
 
+    # Add mask patterns to options for downstream use
+    $options['MaskPatterns'] = $maskPatterns
     return [PSCustomObject]$options
 }
 
@@ -113,6 +132,40 @@ function Convert-WebHeadersToHashtable {
 
 <#
 .SYNOPSIS
+    Sanitizes a string by replacing sensitive patterns with [REDACTED].
+.DESCRIPTION
+    Applies all regex patterns from a given array to a string.
+#>
+function Sanitize-String {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Patterns
+    )
+
+    if (-not $Text -or -not $Patterns -or $Patterns.Count -eq 0) {
+        return $Text
+    }
+
+    $sanitized = $Text
+    foreach ($pattern in $Patterns) {
+        try {
+            $regex = New-Object System.Text.RegularExpressions.Regex($pattern)
+            $sanitized = $regex.Replace($sanitized, '[REDACTED]')
+        }
+        catch {
+            # Silently ignore invalid regex
+            Write-Warning "Invalid mask pattern: $pattern"
+        }
+    }
+    return $sanitized
+}
+
+<#
+.SYNOPSIS
     Centralized parser and formatting factory for PowerShell web responses.
 .DESCRIPTION
     Accepts raw web response objects or network error records, calculates duration metrics, 
@@ -132,7 +185,9 @@ function Convert-WebHeadersToHashtable {
 .OUTPUTS
     [PSCustomObject] Fully structured payload descriptor.
 #>
-function Format-WebResponse {
+
+# Format-WebResponse > Normalize-Content
+function Normalize-Content {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $false)]
@@ -265,20 +320,19 @@ function Format-WebResponse {
 .OUTPUTS
     [PSCustomObject] Containing Resp, Text, and Headers properties.
 #>
-function Invoke-LightRequestRaw {
+function Fetch-Light {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Url,
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Params = @{},
-
-        [Parameter(Mandatory = $false)]
-        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+')
+        [hashtable]$Params = @{}
     )
 
     $options = Build-RequestOptions -Params $Params
+    $maskPatterns = $options.MaskPatterns
+    $safeUrl = Sanitize-String -Text $Url -Patterns $maskPatterns
 
     # Map customized options to standard Invoke-WebRequest parameter set
     $webArgs = @{
@@ -317,15 +371,9 @@ function Invoke-LightRequestRaw {
     }
     catch {
         $errorMessage = $_.Exception.Message
-        $targetUrl = $Url
-
-        foreach ($pattern in $MaskPatterns) {
-            $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
-            $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
-        }
-
-        Write-Error "[Fetcher:Light] Error fetching URL $($targetUrl): $($errorMessage)"
-        throw "Light request error: $($errorMessage)"
+        $safeError = Sanitize-String -Text $errorMessage -Patterns $maskPatterns
+        Write-Error "[Fetch-Light] Error fetching URL $($safeUrl): $($safeError)"
+        throw "Light request error: $($safeError)"
     }
 }
 
@@ -346,7 +394,7 @@ function Invoke-LightRequestRaw {
 .OUTPUTS
     [PSCustomObject[]] Array of objects containing Resp, Text, and Headers.
 #>
-function Invoke-LightBatchRaw {
+function Fetch-LightBatch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -356,7 +404,7 @@ function Invoke-LightBatchRaw {
         [hashtable]$SharedParams = @{},
 
         [Parameter(Mandatory = $false)]
-        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+'),
+        [string[]]$MaskPatterns = $script:DEFAULT_CONFIG.DefaultMaskPatterns,
 
         [Parameter(Mandatory = $false)]
         [hashtable]$RateConfig = @{}
@@ -366,82 +414,110 @@ function Invoke-LightBatchRaw {
         return @()
     }
 
-    $chunkSize = if ($RateConfig.ContainsKey('ChunkSize')) { $RateConfig.ChunkSize } else { 10 }
-    $delayMs = if ($RateConfig.ContainsKey('DelayMs')) { $RateConfig.DelayMs } else { 0 } # Default to 0 delay if not specified
     $results = [System.Collections.Generic.List[object]]::new()
 
-    for ($i = 0; $i -lt $Requests.Count; $i += $chunkSize) {
-        # Define the chunk range
-        $endIndex = [Math]::Min($i + $chunkSize - 1, $Requests.Count - 1)
-        $chunk = $Requests[$i..$endIndex]
+    foreach ($req in $Requests) {
+        $isString = $req -is [string]
+        $targetUrl = if ($isString) { $req } else { $req.Url }
+        $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
 
-        foreach ($req in $chunk) {
-            $isString = $req -is [string]
-            $targetUrl = if ($isString) { $req } else { $req.Url }
-            $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
+        # Merge shared parameters
+        $merged = $SharedParams.Clone()
+        foreach ($key in $reqParams.Keys) { $merged[$key] = $reqParams[$key] }
+        $merged['MaskPatterns'] = $MaskPatterns
 
-            # Merge shared parameters and request specific parameters
-            $merged = $SharedParams.Clone()
-            foreach ($key in $reqParams.Keys) {
-                $merged[$key] = $reqParams[$key]
-            }
+        try {
+            $res = Fetch-Light -Url $targetUrl -Params $merged
+            $results.Add([PSCustomObject]@{
+                Resp    = $res.Resp
+                Text    = $res.Text
+                Headers = $res.Headers
+                Success = $true
+                Error   = $null
+            })
+        }
+        catch {
+            $safeError = Sanitize-String -Text $_.Exception.Message -Patterns $MaskPatterns
+            $safeUrl = Sanitize-String -Text $targetUrl -Patterns $MaskPatterns
+            Write-Warning "[Fetch-LightBatch] Request failed for $($safeUrl): $($safeError)"
+            
+            $results.Add([PSCustomObject]@{
+                Resp    = $null
+                Text    = ""
+                Headers = @{}
+                Success = $false
+                Error   = $safeError
+            })
+        }
+    }
 
-            $options = Build-RequestOptions -Params $merged
-            $webArgs = @{
-                Uri                = $targetUrl
-                Method             = $options.Method
-                MaximumRedirection = $options.MaximumRedirection
-                TimeoutSec         = $options.TimeoutSec
-                ErrorAction        = 'Stop' # Critical: ensures Invoke-WebRequest throws on errors
-            }
+    return $results.ToArray()
+}
 
-            if ($script:SupportsSkipHttpErrorCheck) {
-                $webArgs['SkipHttpErrorCheck'] = $options.SkipHttpErrorCheck
-            }
+<#
+.SYNOPSIS
+    Sequential array fetch (Raw). Sends requests one by one with delay.
+.DESCRIPTION
+    Granular error handling. If one fails, the loop continues.
+#>
+function Fetch-LightArray {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Requests,
 
-            if ($options.Headers.Count -gt 0) { $webArgs['Headers'] = $options.Headers }
-            if ($options.Body) { $webArgs['Body'] = $options.Body }
-            if ($options.ContentType) { $webArgs['ContentType'] = $options.ContentType }
+        [Parameter(Mandatory = $false)]
+        [hashtable]$SharedParams = @{},
 
-            try {
-                # Execute the request
-                $res = Invoke-WebRequest @webArgs
-                $parsedHeaders = Convert-WebHeadersToHashtable -WebHeaders $res.Headers
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = $script:DEFAULT_CONFIG.DefaultMaskPatterns,
 
-                # Success: Add result
-                $results.Add([PSCustomObject]@{
-                    Resp    = $res
-                    Text    = if ($res.Content) { $res.Content } else { "" }
-                    Headers = $parsedHeaders
-                    Success = $true
-                    Error   = $null
-                })
-            }
-            catch {
-                $errorMessage = $_.Exception.Message
-                #$targetUrl = $Url
+        [Parameter(Mandatory = $false)]
+        [hashtable]$RateConfig = @{}
+    )
 
-                foreach ($pattern in $MaskPatterns) {
-                    $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
-                    $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
-                }
+    if (-not $Requests -or $Requests.Count -eq 0) { return @() }
 
-                # Failure: Log error and add a failure placeholder
-                Write-Warning "[Fetcher:LightBatch] Request failed for $($targetUrl): $($errorMessage)"
-                
-                $results.Add([PSCustomObject]@{
-                    Resp    = $null
-                    Text    = ""
-                    Headers = @{}
-                    Success = $false
-                    Error   = $errorMessage
-                })
-            }
+    $delayMs = if ($RateConfig.ContainsKey('DelayMs')) { $RateConfig.DelayMs } else { $script:DEFAULT_CONFIG.DefaultDelayMs }
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    for ($i = 0; $i -lt $Requests.Count; $i++) {
+        $req = $Requests[$i]
+        $isString = $req -is [string]
+        $targetUrl = if ($isString) { $req } else { $req.Url }
+        $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
+
+        $merged = $SharedParams.Clone()
+        foreach ($key in $reqParams.Keys) { $merged[$key] = $reqParams[$key] }
+        $merged['MaskPatterns'] = $MaskPatterns
+
+        # Apply delay BEFORE the request (skip for first item)
+        if ($i -gt 0 -and $delayMs -gt 0) {
+            Start-Sleep -Milliseconds $delayMs
         }
 
-        # Apply delay between chunks (not between every single request if chunkSize > 1)
-        if ($delayMs -gt 0 -and ($i + $chunkSize) -lt $Requests.Count) {
-            Start-Sleep -Milliseconds $delayMs
+        try {
+            $res = Fetch-Light -Url $targetUrl -Params $merged
+            $results.Add([PSCustomObject]@{
+                Resp    = $res.Resp
+                Text    = $res.Text
+                Headers = $res.Headers
+                Success = $true
+                Error   = $null
+            })
+        }
+        catch {
+            $safeError = Sanitize-String -Text $_.Exception.Message -Patterns $MaskPatterns
+            $safeUrl = Sanitize-String -Text $targetUrl -Patterns $MaskPatterns
+            Write-Warning "[Fetch-LightArray] Request failed for $($safeUrl): $($safeError)"
+            
+            $results.Add([PSCustomObject]@{
+                Resp    = $null
+                Text    = ""
+                Headers = @{}
+                Success = $false
+                Error   = $safeError
+            })
         }
     }
 
@@ -463,17 +539,14 @@ function Invoke-LightBatchRaw {
 .OUTPUTS
     [PSCustomObject] Fully structured payload descriptor.
 #>
-function Invoke-StructuredRequest {
+function Fetch-Structured {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Url,
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Params = @{},
-
-        [Parameter(Mandatory = $false)]
-        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+')
+        [hashtable]$Params = @{}
     )
 
     $inputType = if ($Params.ContainsKey('InputType')) { $Params.InputType } else { 'TXT' }
@@ -481,61 +554,26 @@ function Invoke-StructuredRequest {
     $startTime = Get-Date
     $upperMethod = $method.ToUpper()
 
-    # --- IDENTICAL INITIALIZATION BLOCK ---
     $responseObj = $null
     $headersObj = @{}
     $requestError = $null
 
     try {
-        # 1. Fetch raw data
-        $fetchResult = Invoke-LightRequestRaw -Url $Url -Params $Params
-        
+        $fetchResult = Fetch-Light -Url $Url -Params $Params
         if ($fetchResult) {
             $responseObj = $fetchResult.Resp
             $headersObj = $fetchResult.Headers
-            
-            # If the raw request returned null content (e.g., 404 handled as "success" but empty)
-            # we still proceed to formatting, but if the fetch itself threw, we catch it here.
-            if (-not $responseObj) {
-                $requestError = "No response object returned from request"
-            }
         }
-        else {
-            $requestError = "Request returned no result"
-        }
-
-        # 2. Format response content (Headers NOT passed to Format-WebResponse)
-        $formattedResult = Format-WebResponse -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
-
-        # 3. Inject headers
-        if ($formattedResult) {
-            $formattedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
-        }
-
-        return $formattedResult
     }
     catch {
-        $errorMessage = $_.Exception.Message
-        $targetUrl = $Url
-
-        foreach ($pattern in $MaskPatterns) {
-            $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
-            $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
-        }
-
-        # --- SAFE FAILURE OBJECT PATTERN ---
-        # If anything fails (fetch, formatting, injection), create a safe object
-        # so the caller always gets a structured response, never a script crash.
-        Write-Warning "[Fetcher:StructuredRequest] Request failed for $($targetUrl): $($errorMessage)"
-        
-        # Create a safe failure object using the formatter
-        $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMessage)"
-        
-        # Inject empty headers for structural consistency
-        $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
-        
-        return $failureObj
+        $requestError = $_.Exception.Message
     }
+
+    $normalized = Normalize-Content -Response $responseObj -Url $Url -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
+
+    # Inject headers
+    $normalized | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+    return $normalized
 }
 
 <#
@@ -555,7 +593,7 @@ function Invoke-StructuredRequest {
 .OUTPUTS
     [PSCustomObject[]] Array of structured response descriptor objects.
 #>
-function Invoke-StructuredBatch {
+function Fetch-StructuredBatch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -565,7 +603,7 @@ function Invoke-StructuredBatch {
         [hashtable]$SharedParams = @{},
 
         [Parameter(Mandatory = $false)]
-        [string[]]$MaskPatterns = @('key=[^&]+', 'Authorization:\s*[^\r\n]+'),
+        [string[]]$MaskPatterns = $script:DEFAULT_CONFIG.DefaultMaskPatterns,
 
         [Parameter(Mandatory = $false)]
         [hashtable]$RateConfig = @{}
@@ -573,10 +611,7 @@ function Invoke-StructuredBatch {
 
     if (-not $Requests -or $Requests.Count -eq 0) { return @() }
 
-    # Pre-fetch raw data (including headers) from the batch function.
-    # Note: Invoke-LightBatchRaw handles network errors and returns safe placeholders.
-    $lightBatch = Invoke-LightBatchRaw -Requests $Requests -SharedParams $SharedParams -RateConfig $RateConfig
-    
+    $lightBatch = Fetch-LightBatch -Requests $Requests -SharedParams $SharedParams -MaskPatterns $MaskPatterns -RateConfig $RateConfig
     $startTime = Get-Date
     $results = [System.Collections.Generic.List[object]]::new()
 
@@ -584,83 +619,93 @@ function Invoke-StructuredBatch {
         $req = $Requests[$index]
         $item = $lightBatch[$index]
 
-        # --- DIFFERENCE 1: URL Resolution ---
-        # Single Function: $Url is a direct parameter.
-        # Batch Function: Extract URL from $req (string or hashtable).
         $isString = $req -is [string]
         $targetUrl = if ($isString) { $req } else { $req.Url }
+        $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
 
-        # --- DIFFERENCE 2: Parameter Merging ---
-        # Single Function: $Params passed directly.
-        # Batch Function: Manually merge $SharedParams with request-specific params.
         $merged = $SharedParams.Clone()
-        if (-not $isString -and $req.ContainsKey('Params')) {
-            foreach ($k in $req.Params.Keys) { $merged[$k] = $req.Params[$k] }
-        }
-
+        foreach ($key in $reqParams.Keys) { $merged[$key] = $reqParams[$key] }
+        
         $inputType = if ($merged.ContainsKey('InputType')) { $merged.InputType } else { 'TXT' }
         $method = if ($merged.ContainsKey('Method')) { $merged.Method } else { 'GET' }
         $upperMethod = $method.ToUpper()
 
-        # --- IDENTICAL INITIALIZATION BLOCK ---
-        # Matches Invoke-StructuredRequest exactly
+        $responseObj = $item.Resp
+        $headersObj = $item.Headers
+        $networkError = if (-not $item.Success) { $item.Error } else { $null }
+
+        $normalized = Normalize-Content -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $networkError
+        $normalized | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+        $results.Add($normalized)
+    }
+
+    return $results.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Sequential array fetch (Structured). Sends requests one by one with delay.
+.DESCRIPTION
+    Granular error handling. If one fails, the loop continues.
+#>
+function Fetch-StructuredArray {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Requests,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$SharedParams = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$MaskPatterns = $script:DEFAULT_CONFIG.DefaultMaskPatterns,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$RateConfig = @{}
+    )
+
+    if (-not $Requests -or $Requests.Count -eq 0) { return @() }
+
+    $delayMs = if ($RateConfig.ContainsKey('DelayMs')) { $RateConfig.DelayMs } else { $script:DEFAULT_CONFIG.DefaultDelayMs }
+    $startTime = Get-Date
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    for ($i = 0; $i -lt $Requests.Count; $i++) {
+        $req = $Requests[$i]
+        $isString = $req -is [string]
+        $targetUrl = if ($isString) { $req } else { $req.Url }
+        $reqParams = if (-not $isString -and $req.ContainsKey('Params')) { $req.Params } else { @{} }
+
+        $merged = $SharedParams.Clone()
+        foreach ($key in $reqParams.Keys) { $merged[$key] = $reqParams[$key] }
+        
+        $inputType = if ($merged.ContainsKey('InputType')) { $merged.InputType } else { 'TXT' }
+        $method = if ($merged.ContainsKey('Method')) { $merged.Method } else { 'GET' }
+        $upperMethod = $method.ToUpper()
+
+        # Apply delay BEFORE the request (skip for first item)
+        if ($i -gt 0 -and $delayMs -gt 0) {
+            Start-Sleep -Milliseconds $delayMs
+        }
+
         $responseObj = $null
         $headersObj = @{}
-        $requestError = $null
+        $networkError = $null
 
-        # --- IDENTICAL TRY/CATCH BLOCK ---
-        # Mirrors Invoke-StructuredRequest logic for stability.
-        # Even though $item comes from Invoke-LightBatchRaw, we wrap the extraction 
-        # and formatting in try/catch to protect against parsing errors 
-        # or unexpected null states in the loop.
         try {
-            if ($item) {
-                $responseObj = $item.Resp
-                $headersObj = $item.Headers
-                
-                # If the raw item had no response (network failure handled upstream),
-                # we set a specific error message to pass to formatting.
-                if (-not $responseObj) {
-                    $requestError = "Chunk execution error or no response"
-                }
+            $fetchResult = Fetch-Light -Url $targetUrl -Params $merged
+            if ($fetchResult) {
+                $responseObj = $fetchResult.Resp
+                $headersObj = $fetchResult.Headers
             }
-            else {
-                # Fallback if the batch result array is missing an index
-                $requestError = "No batch item found at index $($index)"
-            }
-            
-        # Formatting happens inside the try block so we can catch errors
-            # during parsing (e.g., invalid JSON/XML)
-            $formattedResult = Format-WebResponse -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $requestError
-
-            # --- IDENTICAL INJECTION STEP ---
-            if ($formattedResult) {
-                $formattedResult | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
-            }
-
-            $results.Add($formattedResult)
         }
         catch {
-            $errorMessage = $_.Exception.Message
-            #$targetUrl = $Url
-
-            foreach ($pattern in $MaskPatterns) {
-                $errorMessage = [System.Text.RegularExpressions.Regex]::Replace($errorMessage, $pattern, '[REDACTED]')
-                $targetUrl = [System.Text.RegularExpressions.Regex]::Replace($targetUrl, $pattern, '[REDACTED]')
-            }
-
-            # If anything fails during extraction, parsing, or injection,
-            # we log it and add a safe failure object to the results.
-            Write-Warning "[Fetcher:StructuredBatch] Processing failed for $($targetUrl): $($errorMessage)"
-            
-            # Create a safe failure object that matches the successful structure
-            $failureObj = Format-WebResponse -Response $null -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError "Processing error: $($errorMessage)"
-            
-            # Inject empty headers for consistency
-            $failureObj | Add-Member -MemberType NoteProperty -Name 'Headers' -Value @{} -Force
-            
-            $results.Add($failureObj)
+            $networkError = Sanitize-String -Text $_.Exception.Message -Patterns $merged.MaskPatterns
         }
+
+        $normalized = Normalize-Content -Response $responseObj -Url $targetUrl -Method $upperMethod -InputType $inputType -StartTime $startTime -NetworkError $networkError
+        $normalized | Add-Member -MemberType NoteProperty -Name 'Headers' -Value $headersObj -Force
+        $results.Add($normalized)
     }
 
     return $results.ToArray()
